@@ -1,0 +1,10 @@
+name = "AutomaticDifferention"
+uuid = "b7cca240-b6d4-4d01-a39d-913d0cff65e7"
+authors = ["Maciej Michalski <legeof008@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+ExportAll = "ad2082ca-a69e-11e9-38fa-e96309a31fe4"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

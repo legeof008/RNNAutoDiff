@@ -1,6 +1,7 @@
 module GraphDifferention
 
     using ExportAll
+    using LinearAlgebra:diagm
 
     abstract type GraphNode end
     abstract type Operator <: GraphNode end
@@ -106,7 +107,7 @@ module GraphDifferention
         node.gradient = gradient else node.gradient .+= gradient
     end
 
-    function backward!(order::Vector; seed=1.0)
+    function backward!(order::Vector, seed = ones(length(last(order).output)))
         result = last(order)
         result.gradient = seed
         #@assert length(result.output) == 1 "Gradient is defined only for scalar functions"
@@ -139,10 +140,16 @@ module GraphDifferention
     sin(x::GraphNode) = ScalarOperator(sin, x)
     forward(::ScalarOperator{typeof(sin)}, x) = return sin(x)
     backward(::ScalarOperator{typeof(sin)}, x, g) = tuple(g * cos(x))
-
-    forward(::ScalarOperator{typeof(sin)}, x::Vector) = return sin.(x)
-    backward(::ScalarOperator{typeof(sin)}, x::Vector, g) = tuple(g .* cos.(x))
-
+    
+    import Base: tanh
+    tanh(x::GraphNode) = ScalarOperator(tanh,x)
+    forward(::ScalarOperator{typeof(tanh)}, x) = return tanh.(x)
+    backward(node::ScalarOperator{typeof(tanh)}, x, g) = let
+        𝟏 = ones(length(node.output))
+        x_sqr = node.output.^2
+        derivative_tanh_vector = 𝟏 .- x_sqr
+        tuple(derivative_tanh_vector .* g)
+    end
     # Broadcast operators
 
     import Base: *
@@ -161,6 +168,31 @@ module GraphDifferention
         Jy = diagm(x .* 𝟏)
         tuple(Jx' * g, Jy' * g)
     end
+
+    softmax(x) = return exp.(x) ./ sum(exp.(x))
+    
+    softmax(x::GraphNode) = BroadcastedOperator(softmax,x)
+    forward(::BroadcastedOperator{typeof(GraphDifferention.softmax)},x) = return softmax(x)
+    backward(node::BroadcastedOperator{typeof(GraphDifferention.softmax)},x,g)  = let
+        vector_of_derivatives = Vector()
+        for i in 1:length(node.output)
+            yi = node.output[i]
+            ∑dLdYj_times_Yj = sum(g.* node.output)
+            dLdYi = g[i]
+            result  =  -yi*(∑dLdYj_times_Yj - dLdYi)
+            push!(vector_of_derivatives,result)
+        end
+        tuple(vector_of_derivatives)
+    end
+
+    crossentropy(output,target) =  sum(-target.*log.(output))
+    crossentropy(x::GraphNode,y::GraphNode) = BroadcastedOperator(crossentropy,x,y)
+    forward(::BroadcastedOperator{typeof(GraphDifferention.crossentropy)},x,y) = return crossentropy(x,y)
+    backward(node::BroadcastedOperator{typeof(GraphDifferention.crossentropy)},x,y,g)  = let
+        𝟏 = ones(length(x))
+        tuple(g.*(-(y./x) + (𝟏.-y)./(𝟏.-x)))
+    end
+
 
     Base.Broadcast.broadcasted(-, x::GraphNode, y::GraphNode) = BroadcastedOperator(-, x, y)
     forward(::BroadcastedOperator{typeof(-)}, x, y) = return x .- y
@@ -198,5 +230,4 @@ module GraphDifferention
     end
 
     @exportAll()
-
 end

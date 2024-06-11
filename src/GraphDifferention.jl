@@ -172,8 +172,8 @@ module GraphDifferention
     softmax(x) = return exp.(x) ./ sum(exp.(x))
     
     softmax(x::GraphNode) = BroadcastedOperator(softmax,x)
-    forward(::BroadcastedOperator{typeof(GraphDifferention.softmax)},x) = return softmax(x)
-    backward(node::BroadcastedOperator{typeof(GraphDifferention.softmax)},x,g)  = let
+    forward(::BroadcastedOperator{typeof(softmax)},x) = return softmax(x)
+    backward(node::BroadcastedOperator{typeof(softmax)},x,g)  = let
         vector_of_derivatives = Vector()
         for i in 1:length(node.output)
             yi = node.output[i]

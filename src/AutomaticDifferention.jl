@@ -1,8 +1,7 @@
+include("GraphDifferention.jl")
 module AutomaticDifferention
-    include("GraphDifferention.jl")
 
-    using .GraphDifferention
-
+    using ..GraphDifferention
     using ExportAll
     using Distributions
     using LinearAlgebra:I
@@ -166,16 +165,19 @@ module AutomaticDifferention
         last(network).prediction_handle.output
     end
 
+
     function learning_step_first_run!(xᵢ, ∇fxᵢ, H⁻¹ᵢ, α = 0.01)
+        error("Not usable with matrices")
         # Run the graph forward and backward for the first time just to get new step
         p = -H⁻¹ * ∇fxᵢ;
         xᵢ₊₁ = xᵢ + α*p # this will be the new weight matrix
         return xᵢ₊₁
     end
 
-    function learning_step_second_run!(xᵢ, xᵢ₊₁, ∇fxᵢ, ∇fᵢ₊₁, H⁻¹ᵢ, α = 0.01)
+    function learning_step_second_run!(xᵢ, xᵢ₊₁, ∇fxᵢ, ∇fxᵢ₊₁, H⁻¹ᵢ, α = 0.01)
+        error("Not usable with matrices")
         # Run the graph forward and backward again for the second time to approximate Hessian
-        yᵢ = ∇fxᵢ - ∇fᵢ₊₁
+        yᵢ = ∇fxᵢ - ∇fxᵢ₊₁
         sᵢ = xᵢ₊₁ - xᵢ
         a₁ = (sᵢ * yᵢ')/(yᵢ' * sᵢ)
         a₂ = (yᵢ * sᵢ')/(sᵢ' * yᵢ)

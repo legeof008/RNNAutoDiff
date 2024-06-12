@@ -1,7 +1,7 @@
 module GraphDifferention
 
     using ExportAll
-    using LinearAlgebra:diagm
+    using LinearAlgebra:diagm,Diagonal
 
     abstract type GraphNode end
     abstract type Operator <: GraphNode end
@@ -145,10 +145,9 @@ module GraphDifferention
     tanh(x::GraphNode) = ScalarOperator(tanh,x)
     forward(::ScalarOperator{typeof(tanh)}, x) = return tanh.(x)
     backward(node::ScalarOperator{typeof(tanh)}, x, g) = let
-        𝟏 = ones(length(node.output))
-        x_sqr = node.output.^2
-        derivative_tanh_vector = 𝟏 .- x_sqr
-        tuple(derivative_tanh_vector .* g)
+        x_sqr = tanh.(x).^2
+        derivative_tanh_vector = 1 .- x_sqr
+        tuple(g.*derivative_tanh_vector)
     end
     # Broadcast operators
 
@@ -169,28 +168,36 @@ module GraphDifferention
         tuple(Jx' * g, Jy' * g)
     end
 
-    softmax(x) = return exp.(x) ./ sum(exp.(x))
+    softmax(x) = let     
+        shiftx = x .- maximum(x)
+        exps = exp.(shiftx)
+        return exps ./ sum(exps)
+    end
     
-    softmax(x::GraphNode) = BroadcastedOperator(softmax,x)
-    forward(::BroadcastedOperator{typeof(softmax)},x) = return softmax(x)
-    backward(node::BroadcastedOperator{typeof(softmax)},x,g)  = let
-        vector_of_derivatives = Vector()
-        for i in 1:length(node.output)
-            yi = node.output[i]
-            ∑dLdYj_times_Yj = sum(g.* node.output)
-            dLdYi = g[i]
-            result  =  -yi*(∑dLdYj_times_Yj - dLdYi)
-            push!(vector_of_derivatives,result)
-        end
-        tuple(vector_of_derivatives)
+    softmax(x::GraphNode,y::GraphNode) = BroadcastedOperator(softmax,x,y)
+    forward(::BroadcastedOperator{typeof(softmax)},x,y) = return softmax(x)
+    backward(node::BroadcastedOperator{typeof(softmax)},x,y,g)  = let
+        # this is in-built derivative of cross-entropy along with softmax
+        s = softmax(x)
+        tuple(s - y)
     end
 
-    crossentropy(output,target) =  sum(-target.*log.(output))
+    crossentropy(output,target) =  let 
+        epsilon = 1e-15
+        output_2 = clamp.(output, epsilon, 1 - epsilon)
+        loss = -sum(target .* log.(output_2) + (1 .- target) .* log.(1 .- output_2))
+        return loss / length(target)
+    end 
     crossentropy(x::GraphNode,y::GraphNode) = BroadcastedOperator(crossentropy,x,y)
     forward(::BroadcastedOperator{typeof(GraphDifferention.crossentropy)},x,y) = return crossentropy(x,y)
     backward(node::BroadcastedOperator{typeof(GraphDifferention.crossentropy)},x,y,g)  = let
-        𝟏 = ones(length(x))
-        tuple(g.*(-(y./x) + (𝟏.-y)./(𝟏.-x)))
+        # Ensure x values are clipped to avoid division by zero errors
+        epsilon = 1e-15
+        x = clamp.(x, epsilon, 1 - epsilon)
+        # Calculate the derivative of the cross-entropy loss
+        derivative = - (y ./ x) + ((1 .- y) ./ (1 .- x))
+        return derivative / length(y)
+        tuple(derivative / length(y))
     end
 
 

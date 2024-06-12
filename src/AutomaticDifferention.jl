@@ -2,6 +2,7 @@ include("GraphDifferention.jl")
 module AutomaticDifferention
 
     using ..GraphDifferention
+    using Flux:glorot_uniform
     using ExportAll
     using Distributions
     using LinearAlgebra:I
@@ -15,6 +16,7 @@ module AutomaticDifferention
         x_handle :: GraphNode
         output_handle :: GraphNode
         prediction_handle :: GraphNode
+        target :: GraphNode
         DenseLayerSoftmax(input_output_pair,test_data) = let 
             
             input_num = input_output_pair.first
@@ -22,8 +24,8 @@ module AutomaticDifferention
 
             @assert length(test_data) == output_num
 
-            ordered_graph, w_handle, x_handle, output_handle, prediction_handle = SoftmaxConnectedLayer(input_num,output_num,test_data)
-            new(ordered_graph,w_handle,x_handle,output_handle, prediction_handle)
+            ordered_graph, w_handle, x_handle, output_handle, prediction_handle, target = constructSoftmaxDense(input_num,output_num,test_data)
+            new(ordered_graph,w_handle,x_handle,output_handle, prediction_handle, target)
         end
     end
 
@@ -39,55 +41,107 @@ module AutomaticDifferention
             input_num = input_output_pair.first
             output_num = input_output_pair.second
 
-            ordered_graph, h_handle, w_handle, u_handle, x_handle, output_handle = RnnVanillaLayer(input_num,output_num)
+            ordered_graph, h_handle, w_handle, u_handle, x_handle, output_handle = constructVanillaTanhRnn(input_num,output_num)
             new(ordered_graph,w_handle,u_handle,x_handle,h_handle,output_handle)
         end
     end
 
-    function load_data!(layer::NetworkLayer, data)
-        layer.x_handle.output = data
-    end
-
-    function load_output_as_h!(layer::RnnVanillaTanh)
+    handle_batching_preperations!(layer::DenseLayerSoftmax) = let 
         if !isnothing(layer.output_handle.output)
-            layer.h_handle.output = layer.output_handle.output
+            loss = crossentropy(layer.output_handle.output,layer.target.output)
+            println("Loss = $(loss)")
         end
     end
-
-    handle_batching_preperations!(layer::DenseLayerSoftmax) = println("Loss = $(layer.output_handle.output)")
     handle_batching_preperations!(layer::RnnVanillaTanh) = load_output_as_h!(layer)
 
-    function RnnVanillaLayer(input_number,outputs_number)
+    function constructVanillaTanhRnn(input_number,outputs_number)
         x = Variable(ones(input_number,1), name = "x-rnn")
-        u = Variable(rand(Uniform(-0.01,0.01),outputs_number,input_number), name = "u-rnn")
+        u = Variable(glorot_uniform(outputs_number,input_number), name = "u-rnn")
 
-        h = Variable(rand(Uniform(-0.01,0.01),outputs_number,1), name = "h-rnn")
-        w = Variable(rand(Uniform(-0.01,0.01),outputs_number,outputs_number), name = "w-rnn")
+        h = Variable(glorot_uniform(outputs_number,1), name = "h-rnn")
+        w = Variable(glorot_uniform(outputs_number,outputs_number), name = "w-rnn")
 
-        b = Constant(rand(Uniform(-0.01,0.01),outputs_number,1))
+        b = Constant(glorot_uniform(outputs_number,1))
         o = (u*x .+ w*h) .+ b
 
         activation = tanh(o)
         order = topological_sort(activation)
 
-        #forward!(order)
-        return order, h, w, u, x, last(order)
+        return order, h, w, u, x, activation
     end
 
-    function SoftmaxConnectedLayer(input_number,outputs_number,test_data)
-        b = Constant(rand(Uniform(-0.01,0.01),outputs_number,1))
+    function constructSoftmaxDense(input_number,outputs_number,test_data)
+        b = Constant(glorot_uniform(outputs_number,1))
         x = Variable(ones(input_number,1), name = "x-dense")
 
-        w = Variable(rand(Uniform(-0.01,0.01),outputs_number,input_number), name = "w-dense")
+        w = Variable(glorot_uniform(outputs_number,input_number), name = "w-dense")
         test = Constant(test_data)
 
         o = (w*x) .+ b
-        activation = softmax(o)
-        loss = crossentropy(activation,test)
-        order = topological_sort(loss)
+        activation = softmax(o,test)
+        order = topological_sort(activation)
 
-        #forward!(order)
-        return order, w, x, last(order), activation
+        return order, w, x, last(order), activation, test
+    end
+
+    function load_output_as_h!(layer::RnnVanillaTanh)
+        if !isnothing(layer.output_handle.output)
+            #printstyled("Changing h from ...\n"; color = :yellow)
+            #display(layer.h_handle.output)
+            #printstyled(",to...\n"; color = :yellow)
+            #display(layer.output_handle.output)
+            layer.h_handle.output = layer.output_handle.output
+            @assert layer.h_handle.output == tanh.(layer.ordered_computation_graph[9].output)
+        end
+    end
+    
+    function run_through_batched_data!(batched_data,network)
+        for data_batch in batched_data
+            load_batch_of_data!(data_batch, network)
+        end
+        #backward_net!(network...)
+        #update_net_weights!(network)
+        #printstyled("Predictions:\n"; color = :magenta)
+        #display(last(network).prediction_handle.output)
+    end
+
+    function backward_net!(layers...)
+        @assert length(layers) > 1 "This function can be run for at least two layers."
+        reversed_layers = reverse(layers)
+        last_layer = reversed_layers[1]
+        other_layers = reversed_layers[2:end]
+
+        backward!(last_layer.ordered_computation_graph)
+        gradient_from_last_layer = last_layer.x_handle.gradient
+
+        for iter in eachindex(other_layers)
+
+            backward!(other_layers[iter].ordered_computation_graph,gradient_from_last_layer)
+            current_layer_gradient = other_layers[iter].x_handle.gradient
+
+            if iter + 1 < length(other_layers)
+                backward!(other_layers[iter+1],current_layer_gradient)
+                gradient_from_last_layer = other_layers[iter+1].x_handle.gradient
+            end
+        end
+
+        return last(other_layers).output_handle.gradient
+    end
+
+    function load_batch_of_data!(input_batch,network)
+        for layer in network
+            handle_batching_preperations!(layer)
+        end
+        forward_net!(input_batch,network...)
+        backward_net!(network...)
+        update_net_weights!(network)
+    end
+
+    function backward_net!(layer)
+        backward!(layer.ordered_computation_graph)
+        gradient_from_last_layer = layer.x_handle.gradient
+
+        return gradient_from_last_layer
     end
 
     function forward_net!(input, layers...)
@@ -119,72 +173,43 @@ module AutomaticDifferention
         return output_from_layer
     end
 
-    function backward_net!(layers...)
-        @assert length(layers) > 1 "This function can be run for at least two layers."
-        reversed_layers = reverse(layers)
-        last_layer = reversed_layers[1]
-        other_layers = reversed_layers[2:end]
-
-        backward!(last_layer.ordered_computation_graph)
-        gradient_from_last_layer = last_layer.x_handle.gradient
-
-        for iter in eachindex(other_layers)
-
-            backward!(other_layers[iter].ordered_computation_graph,gradient_from_last_layer)
-            current_layer_gradient = other_layers[iter].x_handle.gradient
-
-            if iter + 1 < length(other_layers)
-                backward!(other_layers[iter+1],current_layer_gradient)
-                gradient_from_last_layer = other_layers[iter+1].x_handle.gradient
-            end
-        end
-
-        return last(other_layers).output_handle.gradient
-    end
-
-    function backward_net!(layer)
-        backward!(layer.ordered_computation_graph)
-        gradient_from_last_layer = layer.x_handle.gradient
-
-        return gradient_from_last_layer
-    end
-
-    function load_batch_of_data!(input_batch,network)
-        for layer in network
-            handle_batching_preperations!(layer)
-        end
-        forward_net!(input_batch,network...)
-    end
-    
-    function run_through_batched_data!(batched_data,network)
-        for data_batch in batched_data
-            load_batch_of_data!(data_batch, network)
-        end
-        backward_net!(network...)
-        println("Predictions vector:")
-        last(network).prediction_handle.output
-    end
-
-
-    function learning_step_first_run!(xᵢ, ∇fxᵢ, H⁻¹ᵢ, α = 0.01)
-        error("Not usable with matrices")
-        # Run the graph forward and backward for the first time just to get new step
-        p = -H⁻¹ * ∇fxᵢ;
-        xᵢ₊₁ = xᵢ + α*p # this will be the new weight matrix
+    function learning_step(xᵢ, ∇fxᵢ, α = 0.1)
+        # steepest descent
+        xᵢ₊₁ = xᵢ - α*∇fxᵢ # this will be the new weight matrix
         return xᵢ₊₁
     end
 
-    function learning_step_second_run!(xᵢ, xᵢ₊₁, ∇fxᵢ, ∇fxᵢ₊₁, H⁻¹ᵢ, α = 0.01)
-        error("Not usable with matrices")
-        # Run the graph forward and backward again for the second time to approximate Hessian
-        yᵢ = ∇fxᵢ - ∇fxᵢ₊₁
-        sᵢ = xᵢ₊₁ - xᵢ
-        a₁ = (sᵢ * yᵢ')/(yᵢ' * sᵢ)
-        a₂ = (yᵢ * sᵢ')/(sᵢ' * yᵢ)
-        a₃ = (sᵢ * sᵢ')/(yᵢ' * sᵢ)
-        H⁻¹ᵢ₊₁ = (I - a₁) * H⁻¹ᵢ * (I - a₂) + a₃
-        return H⁻¹ᵢ₊₁
+    update_learnin_step!(layer::DenseLayerSoftmax) = let 
+        ∇w = layer.w_handle.gradient;
+        w = layer.w_handle.output;
+        #printstyled("Learning step for dense W is:\n"; color = :green )
+        #display(layer.w_handle.output.-learning_step(w,∇w))
+        layer.w_handle.output = learning_step(w,∇w)
     end
+
+    update_learnin_step!(layer::RnnVanillaTanh) = let 
+        ∇w = layer.w_handle.gradient;
+        w = layer.w_handle.output;
+        #printstyled("Learning step for rnn W is:\n"; color = :red )
+        #display(layer.w_handle.output .- learning_step(w,∇w))
+        layer.w_handle.output = learning_step(w,∇w)
+
+        ∇u = layer.u_handle.gradient;
+        u = layer.u_handle.output;
+        #printstyled("Learning step for rnn U is:\n"; color = :red )
+        #display(layer.u_handle.output .- learning_step(u,∇u))
+        layer.u_handle.output = learning_step(u,∇u)
+    end
+
+    function update_net_weights!(layers)
+        #printstyled("Updating weights ...\n"; color = :cyan)
+        for layer in layers
+            update_learnin_step!(layer)
+        end
+    end
+
+  
+
 
     @exportAll
 end # module AutomaticDifferention

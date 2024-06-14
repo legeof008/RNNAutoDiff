@@ -1,216 +1,300 @@
-include("GraphDifferention.jl")
 module AutomaticDifferention
 
-    using ..GraphDifferention
-    using Flux:glorot_uniform
-    using ExportAll
-    using Distributions
-    using LinearAlgebra:I
+    using LinearAlgebra
+    using Flux
+    using NNlib
+    import Statistics: mean
 
+    # Types
+    abstract type GraphNode end
+    abstract type Operator <: GraphNode end
 
-    abstract type NetworkLayer end
+    # Structs
+    struct Constant{T} <: GraphNode
+        output :: T
+    end
 
-    struct DenseLayerSoftmax <: NetworkLayer
-        ordered_computation_graph :: Vector{GraphNode}
-        w_handle :: GraphNode
-        x_handle :: GraphNode
-        output_handle :: GraphNode
-        prediction_handle :: GraphNode
-        target :: GraphNode
-        DenseLayerSoftmax(input_output_pair,test_data) = let 
-            
-            input_num = input_output_pair.first
-            output_num = input_output_pair.second
+    mutable struct Variable <: GraphNode
+        output :: Any
+        gradient :: Any
+        name :: String
+        Variable(output; name="") = new(output, nothing, name)
+    end
 
-            @assert length(test_data) == output_num
+    mutable struct ScalarOperator{F} <: Operator
+        inputs :: Any
+        output :: Any
+        gradient :: Any
+        name :: String
+        ScalarOperator(fun, inputs...; name="") = new{typeof(fun)}(inputs, nothing, nothing, name)
+    end
 
-            ordered_graph, w_handle, x_handle, output_handle, prediction_handle, target = constructSoftmaxDense(input_num,output_num,test_data)
-            new(ordered_graph,w_handle,x_handle,output_handle, prediction_handle, target)
+    mutable struct BroadcastedOperator{F} <: Operator
+        inputs
+        output
+        gradient
+        name :: String
+        BroadcastedOperator(fun, inputs...; name="?") = new{typeof(fun)}(inputs, nothing, nothing, name)
+    end
+
+    # Visitor
+    function visit(node::GraphNode, visited, order)
+        if node ∉ visited
+            push!(visited, node)
+            push!(order, node)
         end
     end
 
-    struct RnnVanillaTanh <: NetworkLayer
-        ordered_computation_graph :: Vector{GraphNode}
-        w_handle :: GraphNode
-        u_handle :: GraphNode
-        x_handle :: GraphNode
-        h_handle :: GraphNode
-        output_handle :: GraphNode
-        RnnVanillaTanh(input_output_pair) = let 
-            
-            input_num = input_output_pair.first
-            output_num = input_output_pair.second
-
-            ordered_graph, h_handle, w_handle, u_handle, x_handle, output_handle = constructVanillaTanhRnn(input_num,output_num)
-            new(ordered_graph,w_handle,u_handle,x_handle,h_handle,output_handle)
+    function visit(node::Operator, visited, order)
+        if node ∉ visited
+            push!(visited, node)
+            for input in node.inputs
+                visit(input, visited, order)
+            end
+            push!(order, node)
         end
     end
 
-    handle_batching_preperations!(layer::DenseLayerSoftmax) = let 
-        if !isnothing(layer.output_handle.output)
-            loss = crossentropy(layer.output_handle.output,layer.target.output)
-            println("Loss = $(loss)")
+    function topological_sort(head::GraphNode)
+        visited = Set()
+        order = Vector()
+        visit(head, visited, order)
+        return order
+    end
+
+    # Forward main
+    reset!(node::Constant) = nothing
+    reset!(node::Variable) = node.gradient = nothing
+    reset!(node::Operator) = node.gradient = nothing
+
+    compute!(node::Constant) = nothing
+    compute!(node::Variable) = nothing
+    compute!(node::Operator) =
+        node.output = forward(node, [input.output for input in node.inputs]...)
+
+    function forward!(order::Vector)
+        for node in order
+            compute!(node)
+            reset!(node)
+        end
+        return last(order).output
+    end
+
+    # Backward main
+    update!(node::Constant, gradient) = nothing
+    update!(node::GraphNode, gradient) = if isnothing(node.gradient)
+        node.gradient = gradient else node.gradient .+= gradient
+    end
+
+    function backward!(order::Vector; seed=1.0)
+        result = last(order)
+        result.gradient = seed
+        for node in reverse(order)
+            backward!(node)
         end
     end
-    handle_batching_preperations!(layer::RnnVanillaTanh) = load_output_as_h!(layer)
 
-    function constructVanillaTanhRnn(input_number,outputs_number)
-        x = Variable(ones(input_number,1), name = "x-rnn")
-        u = Variable(glorot_uniform(outputs_number,input_number), name = "u-rnn")
-
-        h = Variable(glorot_uniform(outputs_number,1), name = "h-rnn")
-        w = Variable(glorot_uniform(outputs_number,outputs_number), name = "w-rnn")
-
-        b = Constant(glorot_uniform(outputs_number,1))
-        o = (u*x .+ w*h) .+ b
-
-        activation = tanh(o)
-        order = topological_sort(activation)
-
-        return order, h, w, u, x, activation
-    end
-
-    function constructSoftmaxDense(input_number,outputs_number,test_data)
-        b = Constant(glorot_uniform(outputs_number,1))
-        x = Variable(ones(input_number,1), name = "x-dense")
-
-        w = Variable(glorot_uniform(outputs_number,input_number), name = "w-dense")
-        test = Constant(test_data)
-
-        o = (w*x) .+ b
-        activation = softmax(o,test)
-        order = topological_sort(activation)
-
-        return order, w, x, last(order), activation, test
-    end
-
-    function load_output_as_h!(layer::RnnVanillaTanh)
-        if !isnothing(layer.output_handle.output)
-            #printstyled("Changing h from ...\n"; color = :yellow)
-            #display(layer.h_handle.output)
-            #printstyled(",to...\n"; color = :yellow)
-            #display(layer.output_handle.output)
-            layer.h_handle.output = layer.output_handle.output
-            @assert layer.h_handle.output == tanh.(layer.ordered_computation_graph[9].output)
+    function backward!(node::Constant) end
+    function backward!(node::Variable) end
+    function backward!(node::Operator)
+        inputs = node.inputs
+        gradients = backward(node, [input.output for input in inputs]..., node.gradient)
+        for (input, gradient) in zip(inputs, gradients)
+            update!(input, gradient)
         end
+    end
+
+    # Default useful operators
+    import Base: ^, *, +, -, /, sin, max, min, log, sum
+
+    +(x::GraphNode, y::GraphNode) = ScalarOperator(+, x, y)
+    forward(::ScalarOperator{typeof(+)}, x, y) = x + y
+    backward(::ScalarOperator{typeof(+)}, x, y, gradient) = (gradient, gradient)
+
+    -(x::GraphNode, y::GraphNode) = ScalarOperator(-, x, y)
+    forward(::ScalarOperator{typeof(-)}, x, y) = x - y
+    backward(::ScalarOperator{typeof(-)}, x, y, gradient) = (gradient, -gradient)
+
+    *(x::GraphNode, y::GraphNode) = ScalarOperator(*, x, y)
+    forward(::ScalarOperator{typeof(*)}, x, y) = x * y
+    backward(::ScalarOperator{typeof(*)}, x, y, gradient) = (y' * gradient, x' * gradient)
+
+    /(x::GraphNode, y::GraphNode) = ScalarOperator(/, x, y)
+    forward(::ScalarOperator{typeof(/)}, x, y) = x / y
+    backward(::ScalarOperator{typeof(/)}, x, y, gradient) = (gradient / y, gradient / y)
+
+    ^(x::GraphNode, n::GraphNode) = ScalarOperator(^, x, n)
+    forward(::ScalarOperator{typeof(^)}, x, n) = x^n
+    backward(::ScalarOperator{typeof(^)}, x, n, gradient) = (gradient * n * x^(n - 1), gradient * log(abs(x)) * x^n)
+
+    sin(x::GraphNode) = ScalarOperator(sin, x)
+    forward(::ScalarOperator{typeof(sin)}, x) = sin(x)
+    backward(::ScalarOperator{typeof(sin)}, x, gradient) = (gradient * cos(x))
+
+    log(x::GraphNode) = ScalarOperator(log, x)
+    forward(::ScalarOperator{typeof(log)}, x) = log(x)
+    backward(::ScalarOperator{typeof(log)}, x, gradient) = (gradient / x)
+
+    max(x::GraphNode, y::GraphNode) = ScalarOperator(max, x, y)
+    forward(::ScalarOperator{typeof(max)}, x, y) = max(x, y)
+    backward(::ScalarOperator{typeof(max)}, x, y, gradient) = (gradient * isless(y, x), gradient * isless(x, y))
+
+    min(x::GraphNode, y::GraphNode) = ScalarOperator(min, x, y)
+    forward(::ScalarOperator{typeof(min)}, x, y) = min(x, y)
+    backward(::ScalarOperator{typeof(min)}, x, y, gradient) = (gradient * isless(x, y), gradient * isless(y, x))
+
+    relu(x::GraphNode) = ScalarOperator(relu, x)
+    forward(::ScalarOperator{typeof(relu)}, x) = max(x, 0)
+    backward(::ScalarOperator{typeof(relu)}, x, gradient) = gradient * isless(0, x)
+
+    logistic(x::GraphNode) = ScalarOperator(logistic, x)
+    forward(::ScalarOperator{typeof(logistic)}, x) = 1 / (1 + exp(-x))
+    backward(::ScalarOperator{typeof(logistic)}, x, gradient) = gradient * exp(-x) / (1 + exp(-x))^2
+
+    # Broadcasted operators
+
+    ^(x::GraphNode, n::Number) = BroadcastedOperator(^, x, n)
+    forward(::BroadcastedOperator{typeof(^)}, x, n) = x .^ n
+    backward(::BroadcastedOperator{typeof(^)}, x, n, g) = tuple(g .* n .* x .^ (n - 1), nothing)
+
+    *(A::GraphNode, x::GraphNode) = BroadcastedOperator(mul!, A, x)
+    forward(::BroadcastedOperator{typeof(mul!)}, A, x) = A * x
+    backward(::BroadcastedOperator{typeof(mul!)}, A, x, g) = tuple(g * x', A' * g)
+
+    relu(x::GraphNode) = BroadcastedOperator(relu, x)
+    forward(::BroadcastedOperator{typeof(relu)}, x) = return max.(x, zero(x))
+    backward(::BroadcastedOperator{typeof(relu)}, x, g) = return tuple(g .* (x .> 0))
+
+    log(x::GraphNode) = BroadcastedOperator(log, x)
+    forward(::BroadcastedOperator{typeof(log)}, x) = 1 ./ (1 .+ exp.(-x))
+    backward(::BroadcastedOperator{typeof(log)}, x, g) = tuple(g .* exp.(x) ./ (1 .+ exp.(x)) .^ 2)
+
+    Base.Broadcast.broadcasted(*, x::GraphNode, y::GraphNode) = BroadcastedOperator(*, x, y)
+    forward(::BroadcastedOperator{typeof(*)}, x, y) = x .* y
+    backward(node::BroadcastedOperator{typeof(*)}, x, y, g) =
+        let
+            𝟏 = ones(length(node.output))
+            Jx = diagm(vec(y .* 𝟏))
+            Jy = diagm(vec(x .* 𝟏))
+            tuple(Jx' * g, Jy' * g)
+        end
+
+    Base.Broadcast.broadcasted(-, x::GraphNode, y::GraphNode) = BroadcastedOperator(-, x, y)
+    forward(::BroadcastedOperator{typeof(-)}, x, y) = x .- y
+    backward(::BroadcastedOperator{typeof(-)}, x, y, g) = tuple(g, -g)
+
+    Base.Broadcast.broadcasted(+, x::GraphNode, y::GraphNode) = BroadcastedOperator(+, x, y)
+    forward(::BroadcastedOperator{typeof(+)}, x, y) = x .+ y
+    backward(::BroadcastedOperator{typeof(+)}, x, y, g) = tuple(g, g)
+
+    sum(x::GraphNode) = BroadcastedOperator(sum, x)
+    forward(::BroadcastedOperator{typeof(sum)}, x) = sum(x)
+    backward(::BroadcastedOperator{typeof(sum)}, x, g) =
+        let
+            𝟏 =
+            J = 𝟏'
+            tuple(ones(length(x))'' * g)
+        end
+
+    Base.Broadcast.broadcasted(/, x::GraphNode, y::GraphNode) = BroadcastedOperator(/, x, y)
+    forward(::BroadcastedOperator{typeof(/)}, x, y) = x ./ y
+    function backward(node::BroadcastedOperator{typeof(/)}, x, y::Real, g)
+        let
+            𝟏 = ones(length(node.output))
+            Jx = diagm(𝟏 ./ y)
+            Jy = (-x ./ y .^ 2)
+            tuple(Jx' * g, Jy' * g)
+        end
+    end
+
+    Base.Broadcast.broadcasted(max, x::GraphNode, y::GraphNode) = BroadcastedOperator(max, x, y)
+    forward(::BroadcastedOperator{typeof(max)}, x, y) = max.(x, y)
+    backward(::BroadcastedOperator{typeof(max)}, x, y, g) =
+        let
+            Jx = diagm(isless.(y, x))
+            Jy = diagm(isless.(x, y))
+            tuple(Jx' * g, Jy' * g)
+        end
+        export Optimizer, Descent
+    
+    # Gradient Optimization
+    abstract type Optimizer end
+
+    struct Descent <: Optimizer
+        learning_rate
+    end
+
+    function (d::Descent)(grad)
+        return d.learning_rate .* grad
+    end
+
+    function softmax(x)
+        exp_x = exp.(x .- maximum(x, dims=1))
+        return exp_x ./ sum(exp_x, dims=1)
+    end
+
+    function softmax_crossentropy_gradient(predictions, targets)
+        probabilities = softmax(predictions)
+        return Float32.(probabilities .- targets)
+    end
+
+    function tanh_derivative(x)
+        return ones(Float32, size(x)) - tanh.(x).^2
+    end
+
+    function loss(predictions, targets)
+        probabilities = softmax(predictions)
+        return -mean(sum(targets .* log.(probabilities), dims=1))
     end
     
-    function run_through_batched_data!(batched_data,network)
-        for data_batch in batched_data
-            load_batch_of_data!(data_batch, network)
-        end
-        #backward_net!(network...)
-        #update_net_weights!(network)
-        #printstyled("Predictions:\n"; color = :magenta)
-        #display(last(network).prediction_handle.output)
+    # Layers
+
+    dense(x::GraphNode, w::GraphNode, b::GraphNode, f::Constant, df::Constant) = BroadcastedOperator(dense, x, w, b, f, df)
+    forward(::BroadcastedOperator{typeof(dense)}, x, w, b, f, df) = f(w * x .+ b)
+    backward(::BroadcastedOperator{typeof(dense)}, x, w, b, f, df, g) = let
+        g = df(w * x .+ b) .* g
+        tuple(w' * g, g * x', sum(g, dims=2))
     end
 
-    function backward_net!(layers...)
-        @assert length(layers) > 1 "This function can be run for at least two layers."
-        reversed_layers = reverse(layers)
-        last_layer = reversed_layers[1]
-        other_layers = reversed_layers[2:end]
+    vanilla_rnn(x::GraphNode, w::GraphNode, b::GraphNode, hw::GraphNode, states::GraphNode, f::Constant, df::Constant) = BroadcastedOperator(vanilla_rnn, x, w, b, hw, states, f, df)
+    forward(o::BroadcastedOperator{typeof(vanilla_rnn)}, x, w, b, hw, states, f, df) = let
+        if isnothing(states)
+            state = zeros(Float32, size(w, 1), size(x, 2))
+            o.inputs[5].output = Matrix{Float32}[]
+        else
+            state = last(states)
+        end
+        h = f.(w * x .+ hw * state .+ b)
+        push!(o.inputs[5].output, h)
+        h
+    end
+    backward(::BroadcastedOperator{typeof(vanilla_rnn)}, x, w, b, u, states, f, df, g) = let
+        dhw = zeros(Float32, size(u))
+        db = zeros(Float32, size(b))
+        previoust_state = zeros(Float32, size(states[1]))
+        dw = zeros(Float32, size(w))
+        for state in reverse(states)
+            zL = w * x .+ u * state .+ b
+            dp = state .+ u * previoust_state
+            dt = df(zL) .* dp .* g
+            dw .+= dt * x'
+            dhw .+= dt * state'
+            db .+= mean(dt, dims=2)
+            previoust_state = state
+        end
+        tuple(w' * g, dw, db, dhw, nothing)
+    end
 
-        backward!(last_layer.ordered_computation_graph)
-        gradient_from_last_layer = last_layer.x_handle.gradient
-
-        for iter in eachindex(other_layers)
-
-            backward!(other_layers[iter].ordered_computation_graph,gradient_from_last_layer)
-            current_layer_gradient = other_layers[iter].x_handle.gradient
-
-            if iter + 1 < length(other_layers)
-                backward!(other_layers[iter+1],current_layer_gradient)
-                gradient_from_last_layer = other_layers[iter+1].x_handle.gradient
+    function update_weights!(graph::Vector, optimizer::Optimizer)
+        for node in graph
+            if isa(node, AutomaticDifferention.Variable)
+                if !isnothing(node.gradient)
+                    node.output .-= optimizer(node.gradient)
+                    node.gradient .= 0
+                elseif !isnothing(node.gradient)
+                    node.output = nothing
+                end
             end
         end
-
-        return last(other_layers).output_handle.gradient
     end
-
-    function load_batch_of_data!(input_batch,network)
-        for layer in network
-            handle_batching_preperations!(layer)
-        end
-        forward_net!(input_batch,network...)
-        backward_net!(network...)
-        update_net_weights!(network)
-    end
-
-    function backward_net!(layer)
-        backward!(layer.ordered_computation_graph)
-        gradient_from_last_layer = layer.x_handle.gradient
-
-        return gradient_from_last_layer
-    end
-
-    function forward_net!(input, layers...)
-        @assert length(layers) > 1 "This function can be run for at least two layers."
-        first_layer = layers[1]
-        other_layers = layers[2:end]
-        first_layer.x_handle.output = input
-
-        output_from_first_layer = forward!(first_layer.ordered_computation_graph)
-        other_layers[1].x_handle.output = output_from_first_layer
-
-        for iter in eachindex(other_layers)
-            
-            current_layer_output = forward!(other_layers[iter].ordered_computation_graph)
-
-            if iter + 1 < length(other_layers)
-                other_layers[iter+1].x_handle.output = current_layer_output
-            end
-        end
-
-        return last(other_layers).output_handle.output
-    end
-
-    function forward_net!(input, layer)
-        layer.x_handle.output = input
-
-        output_from_layer = forward!(layer.ordered_computation_graph)
-
-        return output_from_layer
-    end
-
-    function learning_step(xᵢ, ∇fxᵢ, α = 0.1)
-        # steepest descent
-        xᵢ₊₁ = xᵢ - α*∇fxᵢ # this will be the new weight matrix
-        return xᵢ₊₁
-    end
-
-    update_learnin_step!(layer::DenseLayerSoftmax) = let 
-        ∇w = layer.w_handle.gradient;
-        w = layer.w_handle.output;
-        #printstyled("Learning step for dense W is:\n"; color = :green )
-        #display(layer.w_handle.output.-learning_step(w,∇w))
-        layer.w_handle.output = learning_step(w,∇w)
-    end
-
-    update_learnin_step!(layer::RnnVanillaTanh) = let 
-        ∇w = layer.w_handle.gradient;
-        w = layer.w_handle.output;
-        #printstyled("Learning step for rnn W is:\n"; color = :red )
-        #display(layer.w_handle.output .- learning_step(w,∇w))
-        layer.w_handle.output = learning_step(w,∇w)
-
-        ∇u = layer.u_handle.gradient;
-        u = layer.u_handle.output;
-        #printstyled("Learning step for rnn U is:\n"; color = :red )
-        #display(layer.u_handle.output .- learning_step(u,∇u))
-        layer.u_handle.output = learning_step(u,∇u)
-    end
-
-    function update_net_weights!(layers)
-        #printstyled("Updating weights ...\n"; color = :cyan)
-        for layer in layers
-            update_learnin_step!(layer)
-        end
-    end
-
-  
-
-
-    @exportAll
-end # module AutomaticDifferention
-
+end

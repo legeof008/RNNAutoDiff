@@ -1,52 +1,94 @@
 include("AutomaticDifferention.jl")
+include("DataTransformationUtils.jl")
+
+using .DataTransformationUtils
 using .AutomaticDifferention
-using MLDatasets, Flux
-using Statistics:mean
-
-train_data = MLDatasets.MNIST(split=:train)
-test_data  = MLDatasets.MNIST(split=:test)
-
-# Prepare data
-x1dim = reshape(train_data.features, 28 * 28, :)
-yhot  = Flux.onehotbatch(train_data.targets, 0:9)
-
-in1 = x1dim[:,1][1:196]
-in2 = x1dim[:,1][197:392]
-in3 = x1dim[:,1][393:588]
-in4 = x1dim[:,1][589:end]
-
-in12 = x1dim[:,2][1:196]
-in22 = x1dim[:,2][197:392]
-in32 = x1dim[:,2][393:588]
-in42 = x1dim[:,2][589:end]
-
-in13 = x1dim[:,3][1:196]
-in23 = x1dim[:,3][197:392]
-in33 = x1dim[:,3][393:588]
-in43 = x1dim[:,3][589:end]
-
-in14 = x1dim[:,4][1:196]
-in24 = x1dim[:,4][197:392]
-in34 = x1dim[:,4][393:588]
-in44 = x1dim[:,4][589:end]
-
-yhot1 = yhot[:,2]
-
-# Prepare network
-rnn = RnnVanillaTanh(196 => 64)
-dense = DenseLayerSoftmax(64 => 10, yhot1)
-network = [rnn, dense]
-
-run_through_batched_data!([in1, in2, in3, in4],network)
-run_through_batched_data!([in12, in22, in32, in42],network)
-run_through_batched_data!([in13, in23, in33, in43],network)
-run_through_batched_data!([in14, in24, in34, in44],network)
-
-#update_net_weights!(network)
+using Flux:glorot_uniform
+using Random, Plots
 
 
-# Calculate accuracy
-ŷ = dense.prediction_handle.output;
-y = yhot1;
+function load_data(batch_size)
+    printstyled("Loading data...\n", color = :yellow)
+    xt, yt = DataTransformationUtils.prepare_and_encode(:train; one_hot = true)
+    train_x_batched = DataTransformationUtils.batch_data(xt, batch_size)
+    train_y_batched = DataTransformationUtils.batch_data(yt, batch_size)
+    xv, yv = DataTransformationUtils.prepare_and_encode(:test; one_hot = true)
+    return xt, yt, train_x_batched, train_y_batched, xv, yv
+end
 
-@show acc = round(100 * mean(Flux.onecold(ŷ) .== Flux.onecold(y)));
+batch_size = 100
+xt, yt, xt_batched, yt_batched, xv, yv = load_data(batch_size)
+
+epochs = 5
+
+x = AutomaticDifferention.Variable([0.], name="x")
+
+wd = AutomaticDifferention.Variable(glorot_uniform(10, 64))
+bd = AutomaticDifferention.Variable(glorot_uniform(10, ))
+fd = AutomaticDifferention.Constant(x -> x)
+dfd = AutomaticDifferention.Constant(x -> ones(size(x)))
+
+wr = AutomaticDifferention.Variable(glorot_uniform(64, 196))
+br = AutomaticDifferention.Variable(glorot_uniform(64, ))
+u = AutomaticDifferention.Variable(glorot_uniform(64, 64))
+states = AutomaticDifferention.Variable(nothing, name = "hstates")
+fr = AutomaticDifferention.Constant(tanh)
+dfr = AutomaticDifferention.Constant(AutomaticDifferention.tanh_derivative)
+
+optimizer = AutomaticDifferention.Descent(10e-3)
+
+vanilla_rnn = AutomaticDifferention.vanilla_rnn(x, wr, br, u, states, fr, dfr)
+dense = AutomaticDifferention.dense(vanilla_rnn, wd, bd, fd, dfd)
+ordered_computation_graph = AutomaticDifferention.topological_sort(dense)
+
+batch_loss = Float64[]
+batch_acc = Float64[]
+
+println("Training")
+for epoch in 1:epochs
+    batches = randperm(size(xt_batched, 1))
+    @time for batch in batches
+        states.output = nothing
+        x.output = xt_batched[batch][1:196,:]
+        AutomaticDifferention.forward!(ordered_computation_graph)
+
+        x.output = xt_batched[batch][197:392,:]
+        AutomaticDifferention.forward!(ordered_computation_graph)
+
+        x.output = xt_batched[batch][393:588,:]
+        AutomaticDifferention.forward!(ordered_computation_graph)
+
+        x.output = xt_batched[batch][589:end,:]
+        result = AutomaticDifferention.forward!(ordered_computation_graph)
+
+        loss = AutomaticDifferention.loss(result, yt_batched[batch])
+        acc = DataTransformationUtils.accuracy(result, yt_batched[batch])
+
+        push!(batch_loss, loss)
+        push!(batch_acc, acc)
+
+        gradient = AutomaticDifferention.softmax_crossentropy_gradient(result, yt_batched[batch]) ./ batch_size
+        AutomaticDifferention.backward!(ordered_computation_graph, seed=gradient)
+        AutomaticDifferention.update_weights!(ordered_computation_graph, optimizer)
+    end
+    states.output = nothing
+    test_graph = AutomaticDifferention.topological_sort(dense)
+
+    x.output = xv[  1:196,:]
+    AutomaticDifferention.forward!(test_graph)
+
+    x.output = xv[197:392,:]
+    AutomaticDifferention.forward!(test_graph)
+
+    x.output = xv[393:588,:]
+    AutomaticDifferention.forward!(test_graph)
+
+    x.output = xv[589:end,:]
+    result = AutomaticDifferention.forward!(test_graph)
+
+    loss = AutomaticDifferention.loss(result, yv)
+    acc = DataTransformationUtils.accuracy(result, yv)
+
+    @show epoch loss acc
+end
+plot(batch_loss, xlabel="Batch num", ylabel="loss", title="Loss over batches")

@@ -5,56 +5,6 @@ module AutomaticDifferention
     using NNlib
     import Statistics: mean
 
-    # Types
-    abstract type GraphNode end
-    abstract type Operator <: GraphNode end
-
-    # Structs
-    struct Constant{T} <: GraphNode
-        output :: T
-    end
-
-    mutable struct Variable <: GraphNode
-        output :: Any
-        gradient :: Any
-        name :: String
-        Variable(output; name="") = new(output, nothing, name)
-    end
-
-    mutable struct ScalarOperator{F} <: Operator
-        inputs :: Any
-        output :: Any
-        gradient :: Any
-        name :: String
-        ScalarOperator(fun, inputs...; name="") = new{typeof(fun)}(inputs, nothing, nothing, name)
-    end
-
-    mutable struct BroadcastedOperator{F} <: Operator
-        inputs
-        output
-        gradient
-        name :: String
-        BroadcastedOperator(fun, inputs...; name="?") = new{typeof(fun)}(inputs, nothing, nothing, name)
-    end
-
-    # Visitor
-    function visit(node::GraphNode, visited, order)
-        if node ∉ visited
-            push!(visited, node)
-            push!(order, node)
-        end
-    end
-
-    function visit(node::Operator, visited, order)
-        if node ∉ visited
-            push!(visited, node)
-            for input in node.inputs
-                visit(input, visited, order)
-            end
-            push!(order, node)
-        end
-    end
-
     function topological_sort(head::GraphNode)
         visited = Set()
         order = Vector()
@@ -215,15 +165,7 @@ module AutomaticDifferention
             Jy = diagm(isless.(x, y))
             tuple(Jx' * g, Jy' * g)
         end
-        export Optimizer, Descent
-    
-    # Gradient Optimization
-    abstract type Optimizer end
-
-    struct Descent <: Optimizer
-        learning_rate
-    end
-
+     
     function (d::Descent)(grad)
         return d.learning_rate .* grad
     end
@@ -245,56 +187,5 @@ module AutomaticDifferention
     function loss(predictions, targets)
         probabilities = softmax(predictions)
         return -mean(sum(targets .* log.(probabilities), dims=1))
-    end
-    
-    # Layers
-
-    dense(x::GraphNode, w::GraphNode, b::GraphNode, f::Constant, df::Constant) = BroadcastedOperator(dense, x, w, b, f, df)
-    forward(::BroadcastedOperator{typeof(dense)}, x, w, b, f, df) = f(w * x .+ b)
-    backward(::BroadcastedOperator{typeof(dense)}, x, w, b, f, df, g) = let
-        g = df(w * x .+ b) .* g
-        tuple(w' * g, g * x', sum(g, dims=2))
-    end
-
-    vanilla_rnn(x::GraphNode, w::GraphNode, b::GraphNode, hw::GraphNode, states::GraphNode, f::Constant, df::Constant) = BroadcastedOperator(vanilla_rnn, x, w, b, hw, states, f, df)
-    forward(o::BroadcastedOperator{typeof(vanilla_rnn)}, x, w, b, hw, states, f, df) = let
-        if isnothing(states)
-            state = zeros(Float32, size(w, 1), size(x, 2))
-            o.inputs[5].output = Matrix{Float32}[]
-        else
-            state = last(states)
-        end
-        h = f.(w * x .+ hw * state .+ b)
-        push!(o.inputs[5].output, h)
-        h
-    end
-    backward(::BroadcastedOperator{typeof(vanilla_rnn)}, x, w, b, u, states, f, df, g) = let
-        dhw = zeros(Float32, size(u))
-        db = zeros(Float32, size(b))
-        previoust_state = zeros(Float32, size(states[1]))
-        dw = zeros(Float32, size(w))
-        for state in reverse(states)
-            zL = w * x .+ u * state .+ b
-            dp = state .+ u * previoust_state
-            dt = df(zL) .* dp .* g
-            dw .+= dt * x'
-            dhw .+= dt * state'
-            db .+= mean(dt, dims=2)
-            previoust_state = state
-        end
-        tuple(w' * g, dw, db, dhw, nothing)
-    end
-
-    function update_weights!(graph::Vector, optimizer::Optimizer)
-        for node in graph
-            if isa(node, AutomaticDifferention.Variable)
-                if !isnothing(node.gradient)
-                    node.output .-= optimizer(node.gradient)
-                    node.gradient .= 0
-                elseif !isnothing(node.gradient)
-                    node.output = nothing
-                end
-            end
-        end
     end
 end
